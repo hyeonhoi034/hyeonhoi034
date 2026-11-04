@@ -1,231 +1,231 @@
-"""WJMAX PvP v0.13 protocol over WebSocket for Render Free Web Service.
-Original JSON messages and room logic preserved. This server does NOT change the
-v0.13 Unity client's raw TCP transport; the client needs a WebSocket update.
+"""WJMAX PvP experimental WebSocket server for Render.
+GitHub private repository profile storage is opt-in and fail-closed.
+No plaintext passwords, no API credentials sent to clients.
 """
-import asyncio, json, os, secrets, random
-from aiohttp import web, WSMsgType
+import asyncio, base64, hashlib, hmac, json, os, re, secrets, time
+from aiohttp import web, ClientSession
 
-rooms = {}
-MAX_LINE = 4096
+ROOMS = {}
+MAX_CLIENTS = 8
+GITHUB_REPO = os.getenv('PVP_ACCOUNTS_REPO', '').strip()  # owner/private-repo
+GITHUB_TOKEN = os.getenv('PVP_GITHUB_TOKEN', '').strip()
+GITHUB_PATH = os.getenv('PVP_ACCOUNTS_PATH', 'accounts.json').strip()
+AUTH_ON = bool(GITHUB_REPO and GITHUB_TOKEN)
+account_lock = asyncio.Lock()
+active_names = {}
 
-class WSWriter:
-    def __init__(self, ws):
-        self.ws = ws
-        self.pending = []
-    def is_closing(self):
-        return self.ws.closed
-    def write(self, data):
-        self.pending.append(data)
-    async def drain(self):
-        for data in self.pending:
-            await self.ws.send_str(data.decode('utf-8').rstrip('\n'))
-        self.pending.clear()
-    def close(self):
-        if not self.ws.closed:
-            asyncio.create_task(self.ws.close())
-    async def wait_closed(self):
-        if not self.ws.closed:
-            await self.ws.close()
+async def send(ws, obj):
+    if not ws.closed:
+        await ws.send_json(obj)
 
-class WSReader:
-    def __init__(self, ws):
-        self.ws = ws
-    async def readline(self):
-        msg = await self.ws.receive()
-        if msg.type == WSMsgType.TEXT:
-            data = msg.data.encode('utf-8')
-            return data + b'\n' if len(data) <= MAX_LINE else b'x'*(MAX_LINE+1)
-        if msg.type == WSMsgType.BINARY:
-            return msg.data + b'\n' if len(msg.data) <= MAX_LINE else b'x'*(MAX_LINE+1)
-        return b''
+async def broadcast(room, obj):
+    await asyncio.gather(*(send(w, obj) for w in list(room['members']) if not w.closed), return_exceptions=True)
 
-async def send(w, data):
-    if w.is_closing(): return
+def safe_name(name):
+    return isinstance(name, str) and 3 <= len(name) <= 20 and bool(re.fullmatch(r'[\w가-힣]+', name, re.UNICODE))
+
+def hash_password(password, salt=None):
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 260000)
+    return {'salt': base64.b64encode(salt).decode(), 'hash': base64.b64encode(digest).decode(), 'iterations': 260000}
+
+def verify_password(password, record):
     try:
-        w.write((json.dumps(data, ensure_ascii=False, separators=(',', ':'))+'\n').encode())
-        await w.drain()
-    except (OSError, ConnectionError, RuntimeError): pass
+        expected = base64.b64decode(record['hash'])
+        got = hashlib.pbkdf2_hmac('sha256', password.encode(), base64.b64decode(record['salt']), int(record['iterations']))
+        return hmac.compare_digest(expected, got)
+    except (ValueError, KeyError, TypeError):
+        return False
 
-async def broadcast(room, data):
-    await asyncio.gather(*(send(w, data) for w in list(room['members'])), return_exceptions=True)
+async def github_document():
+    url = f'https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_PATH}'
+    headers = {'Authorization': f'Bearer {GITHUB_TOKEN}', 'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}
+    async with ClientSession(headers=headers, timeout=__import__('aiohttp').ClientTimeout(total=12)) as session:
+        async with session.get(url) as resp:
+            if resp.status == 404:
+                # Don't treat access-denied or wrong repositories as an empty database.
+                async with session.get(f'https://api.github.com/repos/{GITHUB_REPO}') as probe:
+                    if probe.status != 200 or not (await probe.json()).get('private'):
+                        raise RuntimeError('Private profile repository unavailable')
+                return {}, None
+            if resp.status != 200: raise RuntimeError(f'GitHub read failed: HTTP {resp.status}')
+            data = await resp.json()
+            decoded = base64.b64decode(data['content']).decode('utf-8')
+            accounts = json.loads(decoded)
+            if not isinstance(accounts, dict): raise RuntimeError('Malformed accounts document')
+            return accounts, data['sha']
 
-def snapshot(r):
-    scores = [r['scores'].get(w,0) if w else 0 for w in r['players']]
-    if r['bot']: scores[1] = r['bot_score']
-    leader = 0 if scores[0]>scores[1] else 1 if scores[1]>scores[0] else -1
-    return dict(op='state',code=r['code'],players=sum(w is not None for w in r['players']),
-                spectators=len(r['spectators']),bot=int(r['bot']),song=r['song'],revision=r['revision'],
-                ready1=int(r['ready'][0]),ready2=int(r['ready'][1]),
-                prepared1=int(r['prepared'][0]),prepared2=int(r['prepared'][1]),
-                score1=scores[0],score2=scores[1],leader=leader,phase=r['phase'])
+async def github_save(accounts, sha):
+    url = f'https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_PATH}'
+    headers = {'Authorization': f'Bearer {GITHUB_TOKEN}', 'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}
+    payload = {'message': 'Add WJMAX PvP profile', 'content': base64.b64encode(json.dumps(accounts, ensure_ascii=False).encode()).decode()}
+    if sha: payload['sha'] = sha
+    async with ClientSession(headers=headers, timeout=__import__('aiohttp').ClientTimeout(total=12)) as session:
+        async with session.put(url, json=payload) as resp:
+            if resp.status not in (200, 201): raise RuntimeError(f'GitHub write failed: HTTP {resp.status}')
 
-async def maybe_auto_start(room):
-    # Only real human-vs-human matches auto-launch. Bots are simulation-only.
-    if (room['phase']!='lobby' or room['bot'] or room['players'][0] is None or room['players'][1] is None): return
-    if not room['song'] or not all(room['ready']) or not all(room['prepared']): return
-    room['phase']='playing';room['finished']=[False,False]
-    room['scores']={w:0 for w in room['players'] if w}
-    await broadcast(room,snapshot(room))
-    await broadcast(room,dict(op='start_signal',song=room['song'],revision=room['revision'],delay_ms=3000))
+async def authenticate(name, password, create):
+    if not AUTH_ON: return False, 'Account storage not configured on Render'
+    if not safe_name(name): return False, 'Nickname must be 3-20 letters/digits/underscore'
+    if not isinstance(password, str) or len(password) < 8 or len(password) > 128:
+        return False, 'Password must be 8-128 characters'
+    key = name.casefold()
+    async with account_lock:
+        accounts, sha = await github_document()
+        if create:
+            if key in accounts: return False, 'Nickname already exists'
+            accounts[key] = dict(nickname=name, **hash_password(password), created=int(time.time()))
+            await github_save(accounts, sha)
+            return True, 'Account created'
+        if key not in accounts or not verify_password(password, accounts[key]): return False, 'Invalid nickname or password'
+        return True, 'Logged in'
 
-async def bot_play(room, revision):
-    # Deterministic-ish simulated opponent. No Unity instance is launched.
-    try:
-        for tick in range(1, 31):
-            await asyncio.sleep(0.35)
-            if rooms.get(room['code']) is not room or room['phase'] != 'playing' or room['revision'] != revision or not room['bot']:
-                return
-            room['bot_score'] += random.randint(1200, 4000)
-            await broadcast(room, snapshot(room))
-        room['finished'][1] = True
-        if all(room['finished']): room['phase'] = 'finished'
-        await broadcast(room, snapshot(room))
-    except asyncio.CancelledError:
-        pass
+def room_state(r):
+    players = []
+    for idx, p in enumerate(r['players']):
+        players.append({'slot': idx, 'nickname': p['nickname'], 'score': p['score'], 'accuracy': p['accuracy'],
+                        'miss': p['miss'], 'max_combo': p['max_combo'], 'ready': p['ready'], 'prepared': p['prepared'],
+                        'finished': p['finished'], 'team': p['team']})
+    ranking = sorted(players, key=lambda p: (-p['score'], -p['accuracy'], p['miss']))
+    # Winner is resolved only after every remaining participant has finished.
+    # A tied top score does not arbitrarily award one winner.
+    winner = ''
+    winner_score = 0
+    if r['phase'] == 'finished' and ranking:
+        best = ranking[0]
+        winner_score = best['score']
+        tied = [p for p in ranking if (p['score'], p['accuracy'], p['miss']) == (best['score'], best['accuracy'], best['miss'])]
+        winner = best['nickname'] if len(tied) == 1 else 'TIE'
+    state = dict(op='state', code=r['code'], phase=r['phase'], song=r['song'], revision=r['revision'],
+                 winner=winner, winner_score=winner_score,
+                 players=len(players), max_players=r['max_players'], spectators=len(r['spectators']),
+                 entries=players, ranking=ranking, mode=r['mode'], public=r['public'],
+                 score1=players[0]['score'] if players else 0,score2=players[1]['score'] if len(players)>1 else 0,
+                 ready1=int(players[0]['ready']) if players else 0,ready2=int(players[1]['ready']) if len(players)>1 else 0,
+                 prepared1=int(players[0]['prepared']) if players else 0,prepared2=int(players[1]['prepared']) if len(players)>1 else 0)
+    return state
 
-def cancel_bot(room):
-    task = room.get('bot_task')
-    if task and not task.done(): task.cancel()
-    room['bot_task'] = None
+async def update_state(r): await broadcast(r, room_state(r))
 
-async def handler(reader, writer):
-    room = None; role = None
-    try:
-        while True:
-            line = await reader.readline()
-            if not line or len(line)>MAX_LINE: break
-            try:
-                msg = json.loads(line)
-                if not isinstance(msg,dict): continue
-            except (ValueError, UnicodeError): continue
-            op = msg.get('op')
-            if op=='create' and room is None:
-                code=secrets.token_hex(3).upper()
-                room=dict(code=code,players=[writer,None],spectators=set(),members={writer},
-                          scores={writer:0},ready=[False,False],prepared=[False,False],
-                          song='',revision=0,phase='lobby',finished=[False,False],
-                          bot=False,bot_score=0,bot_task=None)
-                rooms[code]=room; role='host'
-                await send(writer,dict(op='joined',role=role,code=code))
-                await broadcast(room,snapshot(room))
-            elif op in ('join','spectate') and room is None:
-                code=str(msg.get('code','')).upper().strip(); found=rooms.get(code)
-                if not found:
-                    await send(writer,dict(op='error',message='Room not found')); continue
-                if op=='join':
-                    if found['players'][1] is not None or found['bot'] or found['phase']!='lobby':
-                        await send(writer,dict(op='error',message='Room full or match in progress')); continue
-                    found['players'][1]=writer;found['scores'][writer]=0;role='guest'
-                else:
-                    if len(found['spectators'])>=20:
-                        await send(writer,dict(op='error',message='Spectator limit'));continue
-                    found['spectators'].add(writer);role='spectator'
-                room=found;room['members'].add(writer)
-                await send(writer,dict(op='joined',role=role,code=code))
-                await broadcast(room,snapshot(room))
-                if role=='guest' and room['song']:
-                    await send(writer,dict(op='prepare_song',song=room['song'],revision=room['revision']))
-            elif room is not None:
-                idx=0 if role=='host' else 1
-                if op=='bot_add' and role=='host' and room['phase']=='lobby':
-                    if room['players'][1] is not None:
-                        await send(writer,dict(op='error',message='Guest already joined'))
-                    else:
-                        room['bot']=True;room['bot_score']=0
-                        room['ready'][1]=bool(room['song']);room['prepared'][1]=bool(room['song'])
-                        await broadcast(room,snapshot(room))
-                elif op=='bot_remove' and role=='host' and room['phase']=='lobby':
-                    room['bot']=False;room['bot_score']=0
-                    room['ready'][1]=False;room['prepared'][1]=False
-                    await broadcast(room,snapshot(room))
-                elif op=='song' and role=='host' and room['phase']=='lobby':
-                    song=msg.get('song')
-                    if isinstance(song,str) and 0<len(song.strip())<=120:
-                        room['song']=song.strip();room['revision']+=1
-                        room['ready']=[False,bool(room['bot'])];room['prepared']=[False,bool(room['bot'])]
-                        await broadcast(room,snapshot(room))
-                        for w in room['players']:
-                            if w: await send(w,dict(op='prepare_song',song=room['song'],revision=room['revision']))
-                elif op=='prepared' and role in ('host','guest') and room['phase']=='lobby':
-                    if msg.get('revision')==room['revision'] and room['song']:
-                        room['prepared'][idx]=msg.get('ok') is True
-                        if not room['prepared'][idx]:room['ready'][idx]=False
-                        await broadcast(room,snapshot(room))
-                        await maybe_auto_start(room)
-                elif op=='ready' and role in ('host','guest') and room['phase']=='lobby':
-                    room['ready'][idx]=(msg.get('ready') is True and room['prepared'][idx])
-                    await broadcast(room,snapshot(room))
-                    await maybe_auto_start(room)
-                elif op=='bot_test_start' and role=='host' and room['bot'] and room['phase']=='lobby':
-                    # Simulation-only: no real chart preparation or launch is claimed.
-                    if not room['song']:
-                        await send(writer,dict(op='error',message='Set a test song first'))
-                    else:
-                        room['phase']='playing';room['finished']=[False,False]
-                        room['scores']={w:0 for w in room['players'] if w};room['bot_score']=0
-                        await broadcast(room,snapshot(room))
-                        await send(writer,dict(op='bot_test_started',message='Simulation only; game chart NOT launched'))
-                        room['bot_task']=asyncio.create_task(bot_play(room,room['revision']))
-                elif op=='start' and role=='host':
-                    if (room['phase']=='lobby' and (room['players'][1] is not None or room['bot']) and room['song']
-                            and all(room['ready']) and all(room['prepared'])):
-                        room['phase']='playing';room['finished']=[False,False]
-                        room['scores']={w:0 for w in room['players'] if w};room['bot_score']=0
-                        await broadcast(room,snapshot(room))
-                        await broadcast(room,dict(op='start_signal',song=room['song'],revision=room['revision'],delay_ms=3000))
-                        if room['bot']: room['bot_task']=asyncio.create_task(bot_play(room,room['revision']))
-                    else:
-                        await send(writer,dict(op='error',message='Both players must prepare and ready'))
-                elif op=='score' and role in ('host','guest') and room['phase']=='playing':
-                    score=msg.get('score')
-                    if type(score) is int and 0<=score<=1000000000:
-                        room['scores'][writer]=max(room['scores'].get(writer,0),score)
-                        await broadcast(room,snapshot(room))
-                elif op=='finish' and role in ('host','guest') and room['phase']=='playing':
-                    room['finished'][idx]=True
-                    if all(room['finished']):room['phase']='finished'
-                    await broadcast(room,snapshot(room))
-                elif op=='reset' and role=='host':
-                    cancel_bot(room)
-                    room['phase']='lobby';room['ready']=[False,bool(room['bot'])];room['prepared']=[False,bool(room['bot'])]
-                    room['finished']=[False,False];room['bot_score']=0;room['scores']={w:0 for w in room['players'] if w}
-                    await broadcast(room,snapshot(room))
-                    if room['song']:
-                        for w in room['players']:
-                            if w: await send(w,dict(op='prepare_song',song=room['song'],revision=room['revision']))
-    except (OSError,ConnectionError,RuntimeError,asyncio.IncompleteReadError):pass
-    finally:
-        if room is not None:
-            room['members'].discard(writer);room['spectators'].discard(writer)
-            if role=='host':
-                cancel_bot(room)
-                rooms.pop(room['code'],None)
-                await broadcast(room,dict(op='error',message='Host disconnected; room closed'))
-                for w in list(room['members']):w.close()
-            else:
-                if role=='guest':
-                    room['players'][1]=None;room['ready'][1]=False;room['prepared'][1]=False
-                    room['scores'].pop(writer,None);room['phase']='lobby';room['ready'][0]=False
-                await broadcast(room,snapshot(room))
-        writer.close()
-        try:await writer.wait_closed()
-        except (OSError,ConnectionError,RuntimeError):pass
+async def maybe_start(r):
+    if r['phase'] != 'lobby' or len(r['players']) < 2 or not r['song']: return
+    if not all(p['ready'] and p['prepared'] for p in r['players']): return
+    await start_match(r)
 
-async def health(request):
-    return web.json_response({'service':'WJMAX PvP','status':'ok','transport':'websocket','rooms':len(rooms)})
+async def start_match(r):
+    r['phase'] = 'playing'
+    for p in r['players']:
+        p.update(score=0,accuracy=0.0,miss=0,max_combo=0,finished=False)
+    await update_state(r)
+    await broadcast(r, dict(op='start_signal',song=r['song'],revision=r['revision'],delay_ms=3000))
 
-async def websocket_handler(request):
-    ws = web.WebSocketResponse(heartbeat=25, max_msg_size=MAX_LINE)
+async def websocket(request):
+    ws = web.WebSocketResponse(heartbeat=25, max_msg_size=16384)
     await ws.prepare(request)
-    await handler(WSReader(ws), WSWriter(ws))
+    room = None; player = None; name = None
+    try:
+        async for msg in ws:
+            if msg.type != web.WSMsgType.TEXT: break
+            try: d = json.loads(msg.data)
+            except (ValueError, TypeError): await send(ws,dict(op='error',message='Invalid JSON'));continue
+            if not isinstance(d, dict): continue
+            op = d.get('op')
+            if op in ('register','login') and room is None:
+                try: ok, message = await authenticate(d.get('nickname'),d.get('password'),op=='register')
+                except Exception as exc: ok, message = False, 'Account backend unavailable'; print('Account error:',repr(exc),flush=True)
+                if ok:
+                    name = d['nickname']
+                    await send(ws,dict(op='auth',ok=True,nickname=name,message=message))
+                else: await send(ws,dict(op='auth',ok=False,message=message))
+            elif op == 'list_rooms':
+                await send(ws,dict(op='rooms',rooms=[dict(code=r['code'],name=r['name'],players=len(r['players']),max_players=r['max_players'],mode=r['mode']) for r in ROOMS.values() if r['public'] and r['phase']=='lobby']))
+            elif op in ('create','join','spectate') and room is None:
+                if not name:
+                    await send(ws,dict(op='error',message='Login first (configure private GitHub profile repository)'));continue
+                if op=='create':
+                    mode = d.get('mode','ffa')
+                    if mode not in ('ffa','teams'): mode='ffa'
+                    max_players = d.get('max_players',4)
+                    if type(max_players)!=int or not 2<=max_players<=MAX_CLIENTS: max_players=4
+                    code = secrets.token_hex(3).upper()
+                    room = dict(code=code,name=str(d.get('name','WJMAX PvP'))[:30],host=ws,players=[],spectators=set(),members={ws},
+                                max_players=max_players,mode=mode,public=d.get('public',True) is True,phase='lobby',song='',revision=0)
+                    ROOMS[code]=room
+                else:
+                    code = str(d.get('code','')).upper().strip()
+                    room = ROOMS.get(code)
+                    if not room:
+                        await send(ws,dict(op='error',message='Room not found'));continue
+                    if op=='join' and (room['phase']!='lobby' or len(room['players'])>=room['max_players']):
+                        await send(ws,dict(op='error',message='Room is full or already playing'));room=None;continue
+                    room['members'].add(ws)
+                if op!='spectate':
+                    player = dict(ws=ws,nickname=name or str(d.get('nickname','Guest'))[:20],score=0,accuracy=0.0,
+                                  miss=0,max_combo=0,ready=False,prepared=False,finished=False,team=len(room['players'])%2)
+                    room['players'].append(player)
+                else: room['spectators'].add(ws)
+                await send(ws,dict(op='joined',role='host' if room['host'] is ws else ('spectator' if op=='spectate' else 'guest'),code=room['code'],slot=len(room['players'])-1 if player else -1))
+                await update_state(room)
+                if player and room['song']:
+                    await send(ws,dict(op='prepare_song',song=room['song'],revision=room['revision']))
+            elif room is not None:
+                if op=='song' and room['host'] is ws and room['phase']=='lobby':
+                    song=d.get('song','')
+                    if isinstance(song,str) and song and len(song)<=200:
+                        room['song']=song;room['revision']+=1
+                        for p in room['players']:p.update(ready=False,prepared=False)
+                        await update_state(room)
+                        for p in room['players']: await send(p['ws'],dict(op='prepare_song',song=song,revision=room['revision']))
+                elif op=='prepared' and player and room['phase']=='lobby' and d.get('revision')==room['revision']:
+                    player['prepared']=d.get('ok') is True
+                    if not player['prepared']:player['ready']=False
+                    await update_state(room);await maybe_start(room)
+                elif op=='ready' and player and room['phase']=='lobby':
+                    player['ready']=d.get('ready') is True and player['prepared']
+                    await update_state(room);await maybe_start(room)
+                elif op=='start' and room['host'] is ws and room['phase']=='lobby':
+                    if len(room['players'])>=2 and room['song'] and all(p['ready'] and p['prepared'] for p in room['players']):
+                        await start_match(room)
+                    else: await send(ws,dict(op='error',message='All players must prepare and ready'))
+                elif op=='score' and player and room['phase']=='playing' and not player['finished']:
+                    score=d.get('score')
+                    if type(score)==int and player['score']<=score<=1000000000:
+                        player['score']=score
+                        accuracy=d.get('accuracy',player['accuracy']);miss=d.get('miss',player['miss']);combo=d.get('max_combo',player['max_combo'])
+                        if type(accuracy) in (float,int) and 0<=accuracy<=100:player['accuracy']=float(accuracy)
+                        if type(miss)==int and 0<=miss<=1000000:player['miss']=miss
+                        if type(combo)==int and 0<=combo<=1000000:player['max_combo']=combo
+                        await update_state(room)
+                elif op=='finish' and player and room['phase']=='playing':
+                    player['finished']=True
+                    # Each client can show its own final screen without pausing opponents.
+                    if all(p['finished'] for p in room['players']):room['phase']='finished'
+                    await update_state(room)
+                elif op=='reset' and room['host'] is ws and room['phase']=='finished':
+                    room['phase']='lobby'
+                    for p in room['players']:p.update(ready=False,prepared=False,finished=False)
+                    await update_state(room)
+                elif op=='leave': break
+    finally:
+        if room:
+            room['members'].discard(ws);room['spectators'].discard(ws)
+            if player in room['players']:room['players'].remove(player)
+            if ws is room['host']:
+                if room['players']:
+                    room['host']=room['players'][0]['ws']
+                    await send(room['host'],dict(op='role',role='host'))
+                else:room['host']=None
+            if not room['players']:
+                ROOMS.pop(room['code'],None)
+            else:
+                if room['phase']=='playing' and all(p['finished'] for p in room['players']):room['phase']='finished'
+                await update_state(room)
     return ws
 
-app = web.Application()
-app.router.add_get('/', health)
-app.router.add_get('/health', health)
-app.router.add_get('/ws', websocket_handler)
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', '10000'))
-    print(f'WJMAX PvP WebSocket server listening on 0.0.0.0:{port}', flush=True)
-    web.run_app(app, host='0.0.0.0', port=port)
+async def health(request): return web.json_response(dict(service='WJMAX PvP',status='ok',transport='websocket',rooms=len(ROOMS),account_backend='configured' if AUTH_ON else 'not_configured'))
+app=web.Application()
+app.router.add_get('/',health)
+app.router.add_get('/health',health)
+app.router.add_get('/ws',websocket)
+if __name__=='__main__':
+    web.run_app(app,host='0.0.0.0',port=int(os.environ.get('PORT','10000')))
