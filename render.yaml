@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: wjmax-pvp
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    healthCheckPath: /health
