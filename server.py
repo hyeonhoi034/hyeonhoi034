@@ -7,7 +7,9 @@ from aiohttp import web, ClientSession
 
 ROOMS = {}
 MAX_CLIENTS = 8
-BOT_DURATION = 18  # seconds; synthetic data, never presented as a real score
+BOT_DURATION = 18  # seconds to reach a synthetic bot target (not a real score)
+BOT_MIN_SCORE = 950_000
+BOT_MAX_SCORE = 1_000_000
 GITHUB_REPO = os.getenv('PVP_ACCOUNTS_REPO', '').strip()  # owner/private-repo
 GITHUB_TOKEN = os.getenv('PVP_GITHUB_TOKEN', '').strip()
 GITHUB_PATH = os.getenv('PVP_ACCOUNTS_PATH', 'accounts.json').strip()
@@ -81,6 +83,47 @@ async def authenticate(name, password, create):
         if key not in accounts or not verify_password(password, accounts[key]): return False, 'Invalid nickname or password'
         return True, 'Logged in'
 
+# Persistent, revocable per-device sessions. Only SHA-256 token hashes are stored in GitHub.
+# A random bearer secret is returned ONCE to the requesting client and must be DPAPI protected locally.
+def session_hash(token):
+    return hashlib.sha256(token.encode('utf-8')).hexdigest()
+
+async def issue_session(name):
+    token = secrets.token_urlsafe(48)
+    key = name.casefold()
+    async with account_lock:
+        accounts, sha = await github_document()
+        if key not in accounts: raise RuntimeError('Account missing')
+        entry = accounts[key]
+        sessions = entry.get('sessions', [])
+        if not isinstance(sessions, list): sessions = []
+        # Limit each account to ten active devices without storing any bearer token.
+        entry['sessions'] = (sessions[-9:] + [session_hash(token)])
+        await github_save(accounts, sha)
+    return token
+
+async def resume_session(token):
+    if not AUTH_ON or not isinstance(token, str) or len(token) < 40 or len(token) > 256:
+        return None
+    digest = session_hash(token)
+    async with account_lock:
+        accounts, _ = await github_document()
+        for entry in accounts.values():
+            if any(isinstance(item,str) and hmac.compare_digest(digest,item) for item in entry.get('sessions', [])):
+                return entry['nickname']
+    return None
+
+async def revoke_session(name, token):
+    if not name or not token: return
+    async with account_lock:
+        accounts, sha = await github_document()
+        entry = accounts.get(name.casefold())
+        if not entry: return
+        digest=session_hash(token)
+        before = entry.get('sessions', [])
+        entry['sessions']=[x for x in before if not hmac.compare_digest(x,digest)]
+        if len(entry['sessions'])!=len(before): await github_save(accounts, sha)
+
 def room_state(r):
     players = []
     for idx, p in enumerate(r['players']):
@@ -113,27 +156,47 @@ async def maybe_start(r):
     if not all(p['ready'] and p['prepared'] for p in r['players']): return
     await start_match(r)
 
+def bot_accuracy(score):
+    """Score / 10,000 rounded to 2 places, for synthetic bots only."""
+    return round(score / 10000, 2)
+
+def initialize_bot_targets(room):
+    """One independent uniform, integer-precision target per bot per match."""
+    for player in room['players']:
+        if player.get('bot'):
+            player['target_score'] = BOT_MIN_SCORE + secrets.randbelow(BOT_MAX_SCORE - BOT_MIN_SCORE + 1)
+            player.update(score=0, accuracy=0.0, miss=0, max_combo=0, finished=False)
+
 async def bot_score_loop(r, test_only=False):
-    """Synthetic opponents for local verification; no fake score assigned to humans."""
-    start=time.monotonic()
+    """Animate simulated bot scores to their preselected targets; never touch human scores."""
+    start = time.monotonic()
     try:
-        while ROOMS.get(r['code']) is r and r['phase'] in ('playing','bot_testing'):
-            elapsed=time.monotonic()-start
-            if test_only and elapsed >= BOT_DURATION:
-                for p in r['players']:
-                    if p.get('bot'): p['finished']=True
-                r['phase']='finished'
-                await update_state(r)
-                break
-            changed=False
-            for idx,p in enumerate(r['players']):
+        while ROOMS.get(r['code']) is r and r['phase'] in ('playing', 'bot_testing'):
+            elapsed = time.monotonic() - start
+            fraction = min(1.0, elapsed / BOT_DURATION) if BOT_DURATION > 0 else 1.0
+            changed = False
+            for p in r['players']:
                 if p.get('bot') and not p['finished']:
-                    # Repeatable synthetic rate; independent of the user's real score.
-                    value=min(1000000, int(elapsed*(2800+idx*735)))
-                    if value>p['score']:
-                        p['score']=value; p['accuracy']=round(92+idx*.65,2)
-                        p['max_combo']=int(elapsed*2.1); changed=True
-            if changed: await update_state(r)
+                    target = p['target_score']
+                    value = target if fraction >= 1 else min(target, int(target * fraction))
+                    if value != p['score']:
+                        p['score'] = value
+                        p['accuracy'] = bot_accuracy(value)
+                        p['max_combo'] = int(elapsed * 2.1)
+                        changed = True
+                    if fraction >= 1:
+                        p['score'] = target
+                        p['accuracy'] = bot_accuracy(target)
+                        p['finished'] = True
+                        changed = True
+            if fraction >= 1:
+                if test_only or all(p['finished'] for p in r['players']):
+                    r['phase'] = 'finished'
+                changed = True
+            if changed:
+                await update_state(r)
+            if fraction >= 1:
+                break
             await asyncio.sleep(.45)
     except asyncio.CancelledError:
         return
@@ -142,6 +205,7 @@ async def start_match(r):
     r['phase'] = 'playing'
     for p in r['players']:
         p.update(score=0,accuracy=0.0,miss=0,max_combo=0,finished=False)
+    initialize_bot_targets(r)
     await update_state(r)
     await broadcast(r, dict(op='start_signal',song=r['song'],revision=r['revision'],delay_ms=3000))
     if any(p.get('bot') for p in r['players']):
@@ -172,7 +236,7 @@ async def detach_room(ws, room, player):
 async def websocket(request):
     ws = web.WebSocketResponse(heartbeat=25, max_msg_size=16384)
     await ws.prepare(request)
-    room = None; player = None; name = None
+    room = None; player = None; name = None; current_token = None
     try:
         async for msg in ws:
             if msg.type != web.WSMsgType.TEXT: break
@@ -185,8 +249,36 @@ async def websocket(request):
                 except Exception as exc: ok, message = False, 'Account backend unavailable'; print('Account error:',repr(exc),flush=True)
                 if ok:
                     name = d['nickname']
-                    await send(ws,dict(op='auth',ok=True,nickname=name,message=message))
+                    try:
+                        current_token = await issue_session(name)
+                        await send(ws,dict(op='auth',ok=True,nickname=name,session=current_token,message=message))
+                    except Exception as exc:
+                        print('Session issuance failed:',repr(exc),flush=True)
+                        name=None; current_token=None
+                        await send(ws,dict(op='auth',ok=False,message='Session persistence unavailable'))
                 else: await send(ws,dict(op='auth',ok=False,message=message))
+            elif op == 'resume':
+                try:
+                    resumed = await resume_session(d.get('session'))
+                    if resumed:
+                        name = resumed; current_token = d['session']
+                        await send(ws,dict(op='auth',ok=True,nickname=name,message='Session restored'))
+                    else: await send(ws,dict(op='auth',ok=False,expired=True,message='Session invalid; log in again'))
+                except Exception as exc:
+                    print('Session resume failed:',repr(exc),flush=True)
+                    await send(ws,dict(op='auth',ok=False,message='Session backend temporarily unavailable'))
+            elif op == 'logout':
+                if room:
+                    await detach_room(ws,room,player)
+                    room=None; player=None
+                try:
+                    await revoke_session(name,current_token)
+                except Exception as exc:
+                    print('Session revoke failed:',repr(exc),flush=True)
+                    await send(ws,dict(op='error',message='Logout could not revoke session; try again'))
+                    continue
+                name=None; current_token=None
+                await send(ws,dict(op='logged_out',message='Logged out'))
             elif op == 'list_rooms':
                 await send(ws,dict(op='rooms',rooms=[dict(code=r['code'],name=r['name'],players=len(r['players']),max_players=r['max_players'],mode=r['mode']) for r in ROOMS.values() if r['public'] and r['phase']=='lobby']))
             elif op in ('create','join','spectate') and room is None:
@@ -242,6 +334,7 @@ async def websocket(request):
                     else:
                         room['phase']='bot_testing'
                         for p in room['players']:p.update(score=0,accuracy=0.,miss=0,max_combo=0,finished=not p.get('bot',False))
+                        initialize_bot_targets(room)
                         await update_state(room)
                         await broadcast(room,dict(op='bot_test_started',message='Synthetic bot test running for 18 seconds'))
                         room['bot_task']=asyncio.create_task(bot_score_loop(room,test_only=True))
