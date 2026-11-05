@@ -7,6 +7,7 @@ from aiohttp import web, ClientSession
 
 ROOMS = {}
 MAX_CLIENTS = 8
+BOT_DURATION = 18  # seconds; synthetic data, never presented as a real score
 GITHUB_REPO = os.getenv('PVP_ACCOUNTS_REPO', '').strip()  # owner/private-repo
 GITHUB_TOKEN = os.getenv('PVP_GITHUB_TOKEN', '').strip()
 GITHUB_PATH = os.getenv('PVP_ACCOUNTS_PATH', 'accounts.json').strip()
@@ -85,7 +86,7 @@ def room_state(r):
     for idx, p in enumerate(r['players']):
         players.append({'slot': idx, 'nickname': p['nickname'], 'score': p['score'], 'accuracy': p['accuracy'],
                         'miss': p['miss'], 'max_combo': p['max_combo'], 'ready': p['ready'], 'prepared': p['prepared'],
-                        'finished': p['finished'], 'team': p['team']})
+                        'finished': p['finished'], 'team': p['team'], 'bot': p.get('bot', False)})
     ranking = sorted(players, key=lambda p: (-p['score'], -p['accuracy'], p['miss']))
     # Winner is resolved only after every remaining participant has finished.
     # A tied top score does not arbitrarily award one winner.
@@ -99,7 +100,7 @@ def room_state(r):
     state = dict(op='state', code=r['code'], phase=r['phase'], song=r['song'], revision=r['revision'],
                  winner=winner, winner_score=winner_score,
                  players=len(players), max_players=r['max_players'], spectators=len(r['spectators']),
-                 entries=players, ranking=ranking, mode=r['mode'], public=r['public'],
+                 entries=players, ranking=ranking, mode=r['mode'], public=r['public'], simulation=r['phase']=='bot_testing', bot_count=sum(p.get('bot',False) for p in r['players']),
                  score1=players[0]['score'] if players else 0,score2=players[1]['score'] if len(players)>1 else 0,
                  ready1=int(players[0]['ready']) if players else 0,ready2=int(players[1]['ready']) if len(players)>1 else 0,
                  prepared1=int(players[0]['prepared']) if players else 0,prepared2=int(players[1]['prepared']) if len(players)>1 else 0)
@@ -112,12 +113,61 @@ async def maybe_start(r):
     if not all(p['ready'] and p['prepared'] for p in r['players']): return
     await start_match(r)
 
+async def bot_score_loop(r, test_only=False):
+    """Synthetic opponents for local verification; no fake score assigned to humans."""
+    start=time.monotonic()
+    try:
+        while ROOMS.get(r['code']) is r and r['phase'] in ('playing','bot_testing'):
+            elapsed=time.monotonic()-start
+            if test_only and elapsed >= BOT_DURATION:
+                for p in r['players']:
+                    if p.get('bot'): p['finished']=True
+                r['phase']='finished'
+                await update_state(r)
+                break
+            changed=False
+            for idx,p in enumerate(r['players']):
+                if p.get('bot') and not p['finished']:
+                    # Repeatable synthetic rate; independent of the user's real score.
+                    value=min(1000000, int(elapsed*(2800+idx*735)))
+                    if value>p['score']:
+                        p['score']=value; p['accuracy']=round(92+idx*.65,2)
+                        p['max_combo']=int(elapsed*2.1); changed=True
+            if changed: await update_state(r)
+            await asyncio.sleep(.45)
+    except asyncio.CancelledError:
+        return
+
 async def start_match(r):
     r['phase'] = 'playing'
     for p in r['players']:
         p.update(score=0,accuracy=0.0,miss=0,max_combo=0,finished=False)
     await update_state(r)
     await broadcast(r, dict(op='start_signal',song=r['song'],revision=r['revision'],delay_ms=3000))
+    if any(p.get('bot') for p in r['players']):
+        r['bot_task']=asyncio.create_task(bot_score_loop(r))
+
+async def detach_room(ws, room, player):
+    """Remove one socket from a match without closing its WebSocket or login."""
+    room['members'].discard(ws)
+    room['spectators'].discard(ws)
+    if player is not None and player in room['players']:
+        room['players'].remove(player)
+    if ws is room['host']:
+        room['host'] = next((p['ws'] for p in room['players'] if not p.get('bot')), None)
+        if room['host'] is not None:
+            await send(room['host'], dict(op='role',role='host'))
+    if not room['players'] or all(p.get('bot') for p in room['players']):
+        if room.get('bot_task'): room['bot_task'].cancel()
+        ROOMS.pop(room['code'],None)
+        # Spectators may still have the room on their screens.
+        await broadcast(room,dict(op='room_closed',message='All players left'))
+        room['spectators'].clear()
+        room['members'].clear()
+    else:
+        if room['phase']=='playing' and all(p['finished'] for p in room['players']):
+            room['phase']='finished'
+        await update_state(room)
 
 async def websocket(request):
     ws = web.WebSocketResponse(heartbeat=25, max_msg_size=16384)
@@ -149,7 +199,7 @@ async def websocket(request):
                     if type(max_players)!=int or not 2<=max_players<=MAX_CLIENTS: max_players=4
                     code = secrets.token_hex(3).upper()
                     room = dict(code=code,name=str(d.get('name','WJMAX PvP'))[:30],host=ws,players=[],spectators=set(),members={ws},
-                                max_players=max_players,mode=mode,public=d.get('public',True) is True,phase='lobby',song='',revision=0)
+                                max_players=max_players,mode=mode,public=d.get('public',True) is True,phase='lobby',song='',revision=0,bot_task=None)
                     ROOMS[code]=room
                 else:
                     code = str(d.get('code','')).upper().strip()
@@ -169,13 +219,40 @@ async def websocket(request):
                 if player and room['song']:
                     await send(ws,dict(op='prepare_song',song=room['song'],revision=room['revision']))
             elif room is not None:
-                if op=='song' and room['host'] is ws and room['phase']=='lobby':
+                if op=='bot_add' and room['host'] is ws and room['phase']=='lobby':
+                    if len(room['players']) >= room['max_players']:
+                        await send(ws,dict(op='error',message='Room full: increase maximum players'))
+                    else:
+                        idx=1
+                        used={p['nickname'] for p in room['players']}
+                        while 'TEST BOT '+str(idx) in used: idx+=1
+                        bot=dict(ws=None,nickname='TEST BOT '+str(idx),bot=True,score=0,accuracy=0.0,
+                                 miss=0,max_combo=0,ready=True,prepared=True,finished=False,team=len(room['players'])%2)
+                        room['players'].append(bot)
+                        await update_state(room)
+                        await send(ws,dict(op='bot_added',message=bot['nickname']+' added (synthetic)'))
+                elif op=='bot_remove' and room['host'] is ws and room['phase']=='lobby':
+                    bots=[p for p in room['players'] if p.get('bot')]
+                    if bots:
+                        room['players'].remove(bots[-1]); await update_state(room)
+                    else: await send(ws,dict(op='error',message='No test bots in room'))
+                elif op=='bot_test_start' and room['host'] is ws and room['phase']=='lobby':
+                    if not any(p.get('bot') for p in room['players']):
+                        await send(ws,dict(op='error',message='Add a test bot first (F10)'))
+                    else:
+                        room['phase']='bot_testing'
+                        for p in room['players']:p.update(score=0,accuracy=0.,miss=0,max_combo=0,finished=not p.get('bot',False))
+                        await update_state(room)
+                        await broadcast(room,dict(op='bot_test_started',message='Synthetic bot test running for 18 seconds'))
+                        room['bot_task']=asyncio.create_task(bot_score_loop(room,test_only=True))
+                elif op=='song' and room['host'] is ws and room['phase']=='lobby':
                     song=d.get('song','')
                     if isinstance(song,str) and song and len(song)<=200:
                         room['song']=song;room['revision']+=1
-                        for p in room['players']:p.update(ready=False,prepared=False)
+                        for p in room['players']:p.update(ready=p.get('bot',False),prepared=p.get('bot',False))
                         await update_state(room)
-                        for p in room['players']: await send(p['ws'],dict(op='prepare_song',song=song,revision=room['revision']))
+                        for p in room['players']:
+                            if p['ws'] is not None: await send(p['ws'],dict(op='prepare_song',song=song,revision=room['revision']))
                 elif op=='prepared' and player and room['phase']=='lobby' and d.get('revision')==room['revision']:
                     player['prepared']=d.get('ok') is True
                     if not player['prepared']:player['ready']=False
@@ -203,23 +280,17 @@ async def websocket(request):
                     await update_state(room)
                 elif op=='reset' and room['host'] is ws and room['phase']=='finished':
                     room['phase']='lobby'
-                    for p in room['players']:p.update(ready=False,prepared=False,finished=False)
+                    if room.get('bot_task'):room['bot_task'].cancel();room['bot_task']=None
+                    for p in room['players']:p.update(ready=p.get('bot',False),prepared=p.get('bot',False),finished=False)
                     await update_state(room)
-                elif op=='leave': break
+                elif op=='leave':
+                    await detach_room(ws, room, player)
+                    room = None
+                    player = None
+                    await send(ws,dict(op='left',message='Returned to lobby'))
     finally:
         if room:
-            room['members'].discard(ws);room['spectators'].discard(ws)
-            if player in room['players']:room['players'].remove(player)
-            if ws is room['host']:
-                if room['players']:
-                    room['host']=room['players'][0]['ws']
-                    await send(room['host'],dict(op='role',role='host'))
-                else:room['host']=None
-            if not room['players']:
-                ROOMS.pop(room['code'],None)
-            else:
-                if room['phase']=='playing' and all(p['finished'] for p in room['players']):room['phase']='finished'
-                await update_state(room)
+            await detach_room(ws, room, player)
     return ws
 
 async def health(request): return web.json_response(dict(service='WJMAX PvP',status='ok',transport='websocket',rooms=len(ROOMS),account_backend='configured' if AUTH_ON else 'not_configured'))
