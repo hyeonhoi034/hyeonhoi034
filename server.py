@@ -7,11 +7,14 @@ from aiohttp import web, ClientSession
 
 ROOMS = {}
 MAX_CLIENTS = 8
-VERSION = '0.22.7'
+VERSION = '0.22.7'  # Retained wire version for existing deployed clients; song sync adds optional fields
+BUILD_VERSION = '0.22.13'
 BOT_MIN_SCORE = 950_000
 BOT_MAX_SCORE = 1_000_000
 START_DELAY_MS = 3000
 MAX_CHART_NOTES = 50_000
+VERSUS_POOL_LIMIT = 240
+VERSUS_CANDIDATES = 5
 GITHUB_REPO = os.getenv('PVP_ACCOUNTS_REPO', '').strip()  # owner/private-repo
 GITHUB_TOKEN = os.getenv('PVP_GITHUB_TOKEN', '').strip()
 GITHUB_PATH = os.getenv('PVP_ACCOUNTS_PATH', 'accounts.json').strip()
@@ -166,6 +169,14 @@ def room_state(r):
                  score1=players[0]['score'] if players else 0,score2=players[1]['score'] if len(players)>1 else 0,
                  ready1=int(players[0]['ready']) if players else 0,ready2=int(players[1]['ready']) if len(players)>1 else 0,
                  prepared1=int(players[0]['prepared']) if players else 0,prepared2=int(players[1]['prepared']) if len(players)>1 else 0)
+    if r['mode'] == 'versus':
+        state.update(versus_stage=r['versus_stage'], versus_candidates=list(r['versus_candidates']),
+                     versus_tracks=list(r['versus_tracks']), versus_ban1=r['versus_bans'].get(0, -1),
+                     versus_ban2=r['versus_bans'].get(1, -1), versus_ban_turn=r['versus_ban_turn'],
+                     versus_index=r['versus_index'], versus_wins1=r['versus_wins'].get(0, 0),
+                     versus_wins2=r['versus_wins'].get(1, 0), versus_winner=r['versus_winner'],
+                     versus_pool_received=sum(bool(v) for v in r['versus_pools'].values()),
+                     versus_history=list(r['versus_history']))
     return state
 
 async def update_state(r): await broadcast(r, room_state(r))
@@ -173,8 +184,11 @@ async def update_state(r): await broadcast(r, room_state(r))
 async def maybe_start(r):
     if ROOMS.get(r['code']) is not r or r['phase'] != 'lobby' or len(r['players']) < 2 or not r['song']:
         return False
+    if r['mode'] == 'versus' and (r['versus_stage'] != 'round' or len(r['players']) != 2):
+        return False
     if not all(p['ready'] and p['prepared'] for p in r['players']):
         return False
+    print(f"[PVP READY] all participants confirmed room={r['code']} revision={r['revision']}", flush=True)
     await start_match(r)
     return True
 
@@ -242,15 +256,116 @@ def advance_match(room):
             player.update(score=score, accuracy=bot_accuracy(score), finished=finished)
     if finished:
         room['phase'] = 'finished'
+        versus_record_round(room)
+
+def versus_valid_chart(value):
+    if not isinstance(value, str) or len(value) > 200:
+        return False
+    parts = value.split('|')
+    return (len(parts) == 3 and all(x and x.strip() == x for x in parts)
+            and parts[2] in ('Key4', 'Key5', 'Key6')
+            and bool(re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,24}', parts[1]))
+            and not any(ord(c) < 32 for c in value))
+
+
+def versus_initialize(room):
+    room.update(versus_stage='pool', versus_candidates=[], versus_tracks=[],
+                versus_bans={}, versus_ban_turn=0, versus_pools={},
+                versus_wins={0: 0, 1: 0}, versus_index=0,
+                versus_winner='', versus_history=[], versus_round_recorded=False)
+
+
+async def versus_offer_pool(room, player, raw):
+    if room['versus_stage'] != 'pool' or room['phase'] != 'lobby':
+        await send(player['ws'], dict(op='versus_error', message='Song pool is not open')); return
+    if not isinstance(raw, list) or not 5 <= len(raw) <= VERSUS_POOL_LIMIT or any(not versus_valid_chart(x) for x in raw):
+        await send(player['ws'], dict(op='versus_error', message='Invalid native chart list (5-240 chart signatures)')); return
+    pool = set(raw)
+    room['versus_pools'][player['slot']] = pool
+    print(f"[PVP VERSUS] pool room={room['code']} slot={player['slot']} size={len(pool)}", flush=True)
+    if len(room['players']) != 2 or len(room['versus_pools']) != 2:
+        await update_state(room); return
+    common = sorted(set.intersection(*room['versus_pools'].values()))
+    if len(common) < VERSUS_CANDIDATES:
+        await broadcast(room, dict(op='versus_error', message='Two players share fewer than five verified chart signatures; check installed charts/key/mode'))
+        await update_state(room); return
+    # secrets.SystemRandom for fresh 5-chart selection, never client-authoritative.
+    room['versus_candidates'] = secrets.SystemRandom().sample(common, VERSUS_CANDIDATES)
+    room['versus_stage'] = 'ban'
+    room['versus_ban_turn'] = min(p['slot'] for p in room['players'])
+    print(f"[PVP VERSUS] BAN room={room['code']} candidates={room['versus_candidates']}", flush=True)
+    await update_state(room)
+
+
+async def versus_apply_ban(room, player, index):
+    if room['phase'] != 'lobby' or room['versus_stage'] != 'ban':
+        await send(player['ws'], dict(op='versus_error', message='BAN phase is no longer active')); return
+    if type(index) is not int or not 0 <= index < VERSUS_CANDIDATES:
+        await send(player['ws'], dict(op='versus_error', message='Invalid BAN index')); return
+    if player['slot'] != room['versus_ban_turn'] or player['slot'] in room['versus_bans']:
+        await send(player['ws'], dict(op='versus_error', message='Not your BAN turn')); return
+    if index in room['versus_bans'].values():
+        await send(player['ws'], dict(op='versus_error', message='This chart was already banned')); return
+    room['versus_bans'][player['slot']] = index
+    print(f"[PVP VERSUS] BAN room={room['code']} slot={player['slot']} index={index}", flush=True)
+    if len(room['versus_bans']) == 1:
+        room['versus_ban_turn'] = next(p['slot'] for p in room['players'] if p['slot'] not in room['versus_bans'])
+        await update_state(room); return
+    room['versus_tracks'] = [s for i, s in enumerate(room['versus_candidates']) if i not in room['versus_bans'].values()]
+    room['versus_stage'] = 'round'
+    room['versus_index'] = 0
+    room['versus_round_recorded'] = False
+    await reset_round(room, song=room['versus_tracks'][0])
+
+
+def versus_record_round(room):
+    if room.get('mode') != 'versus' or room['phase'] != 'finished' or room.get('versus_round_recorded'):
+        return
+    room['versus_round_recorded'] = True
+    ranked = sorted(room['players'], key=ranking_key)
+    winner_slot = -1 if len(ranked) != 2 or ranking_key(ranked[0]) == ranking_key(ranked[1]) else ranked[0]['slot']
+    if winner_slot >= 0:
+        room['versus_wins'][winner_slot] = room['versus_wins'].get(winner_slot, 0) + 1
+    room['versus_history'].append(dict(song=room['song'], winner_slot=winner_slot,
+                                       scores={str(p['slot']): p['score'] for p in room['players']}))
+    print(f"[PVP VERSUS] round result room={room['code']} chart={room['versus_index'] + 1} winner_slot={winner_slot} wins={room['versus_wins']}", flush=True)
+    if max(room['versus_wins'].values()) >= 2 or (room['versus_index'] >= 2 and winner_slot >= 0):
+        room['versus_stage'] = 'complete'
+        if room['versus_wins'][0] == room['versus_wins'][1]:
+            room['versus_winner'] = 'TIE'
+        else:
+            winning_slot = max(room['versus_wins'], key=lambda n: room['versus_wins'][n])
+            room['versus_winner'] = next((p['nickname'] for p in room['players'] if p['slot'] == winning_slot), 'TIE')
+        print(f"[PVP VERSUS] series complete room={room['code']} winner={room['versus_winner']}", flush=True)
+
+
+async def versus_next(room):
+    if room['versus_stage'] != 'round' or room['phase'] != 'finished': return False
+    last = room['versus_history'][-1] if room['versus_history'] else {}
+    if last.get('winner_slot', -1) >= 0:
+        room['versus_index'] += 1
+    # A tied chart is replayed (does not consume one of the three charts).
+    if room['versus_index'] >= len(room['versus_tracks']):
+        room['versus_stage'] = 'complete'
+        await update_state(room)
+        return True
+    room['versus_round_recorded'] = False
+    await reset_round(room, song=room['versus_tracks'][room['versus_index']])
+    return True
+
 
 async def start_match(r):
+    # The phase transition is performed synchronously BEFORE any await: idempotent gate.
+    if r['phase'] != 'lobby' or (r['mode'] == 'versus' and r['versus_stage'] != 'round'): return
     r['phase'] = 'playing'
+    print(f"[PVP START] room={r['code']} revision={r['revision']} song={r['song']}", flush=True)
     for p in r['players']:
         clear_score(p)
     initialize_bot_targets(r)
     await broadcast(r, room_state(r), dict(op='start_signal', song=r['song'], revision=r['revision'], delay_ms=START_DELAY_MS))
 
 async def reset_round(room, message=None, song=''):
+    print(f"[PVP SONG] room={room['code']} revision={room['revision'] + 1} song={song or '(none)'}; invalidate ready/prepared", flush=True)
     room.update(phase='lobby', song=song, revision=room['revision'] + 1)
     for player in room['players']:
         clear_score(player)
@@ -278,7 +393,10 @@ async def detach_room(ws, room, player):
         room['spectators'].clear()
         room['members'].clear()
     else:
-        if room['phase'] == 'playing':
+        if room['mode'] == 'versus':
+            versus_initialize(room)
+            await reset_round(room, message='Opponent left; versus restarted, waiting for a second player')
+        elif room['phase'] == 'playing':
             advance_match(room)
         if host_left:
             await send(room['host'], dict(op='role', role='host'))
@@ -287,7 +405,7 @@ async def detach_room(ws, room, player):
             await maybe_start(room)
 
 async def websocket(request):
-    ws = web.WebSocketResponse(heartbeat=25, max_msg_size=16384)
+    ws = web.WebSocketResponse(heartbeat=25, max_msg_size=65536)
     await ws.prepare(request)
     room = None; player = None; name = None; current_token = None
     try:
@@ -341,19 +459,23 @@ async def websocket(request):
                     await send(ws,dict(op='error',message='Login first (configure private GitHub profile repository)'));continue
                 if op=='create':
                     mode = d.get('mode','ffa')
-                    if mode not in ('ffa','teams'): mode='ffa'
+                    if mode not in ('ffa','teams','versus'): mode='ffa'
                     max_players = d.get('max_players',4)
                     if type(max_players)!=int or not 2<=max_players<=MAX_CLIENTS: max_players=4
+                    if mode == 'versus': max_players = 2
                     code = secrets.token_hex(3).upper()
                     room = dict(code=code,name=str(d.get('name','WJMAX PvP'))[:30],host=ws,players=[],spectators=set(),members={ws},
                                 max_players=max_players,mode=mode,public=d.get('public',True) is True,phase='lobby',song='',revision=0,
                                 broadcast_lock=asyncio.Lock())
+                    if mode == 'versus': versus_initialize(room)
                     ROOMS[code]=room
                 else:
                     code = str(d.get('code','')).upper().strip()
                     room = ROOMS.get(code)
                     if not room:
                         await send(ws,dict(op='error',message='Room not found'));continue
+                    if op=='join' and room['mode'] == 'versus' and d.get('versus_capable') is not True:
+                        await send(ws,dict(op='error',message='Versus mode requires v0.22.13+ client'));room=None;continue
                     if op=='join' and (room['phase']!='lobby' or len(room['players'])>=room['max_players']):
                         await send(ws,dict(op='error',message='Room is full or already playing'));room=None;continue
                     room['members'].add(ws)
@@ -370,7 +492,21 @@ async def websocket(request):
                 # Older clients may omit the revision on actions other than prepared.
                 revision = d.get('revision', room['revision'])
                 current_round = type(revision) is int and revision == room['revision']
-                if op=='bot_add' and is_host and phase=='lobby':
+                if op == 'chart_pool' and player and room['mode'] == 'versus' and current_round:
+                    await versus_offer_pool(room, player, d.get('charts'))
+                elif op == 'versus_ban' and player and room['mode'] == 'versus' and current_round:
+                    await versus_apply_ban(room, player, d.get('index'))
+                elif op == 'versus_next' and is_host and room['mode'] == 'versus' and current_round:
+                    if not await versus_next(room):
+                        await send(ws,dict(op='versus_error',message='Cannot advance before both players finish'))
+                elif op == 'versus_restart' and is_host and room['mode'] == 'versus' and phase == 'finished' and room['versus_stage'] == 'complete' and current_round:
+                    versus_initialize(room)
+                    await reset_round(room, message='New versus: both players must send chart lists')
+                elif op == 'bot_add' and room['mode'] == 'versus':
+                    await send(ws,dict(op='versus_error',message='Bots are disabled in 1v1 Versus'))
+                elif op == 'bot_remove' and room['mode'] == 'versus':
+                    await send(ws,dict(op='versus_error',message='Bots are disabled in 1v1 Versus'))
+                elif op=='bot_add' and is_host and phase=='lobby':
                     if len(room['players']) >= room['max_players']:
                         await send(ws,dict(op='error',message='Room is full'))
                     else:
@@ -388,6 +524,8 @@ async def websocket(request):
                     else: await send(ws,dict(op='error',message='No bots in room'))
                 elif op=='bot_test_start':
                     await send(ws,dict(op='error',message='Select a song and ready up to play with bots'))
+                elif op=='song' and room['mode'] == 'versus':
+                    await send(ws,dict(op='versus_error',message='Versus charts are selected by the server after BAN'))
                 elif op=='song':
                     song=d.get('song','')
                     if not is_host or phase not in ('lobby', 'finished'):
@@ -398,13 +536,45 @@ async def websocket(request):
                         await reset_round(room, song=song)
                     else:
                         await send(ws, dict(op='error', message='Invalid chart name'))
-                elif op=='prepared' and player and phase=='lobby' and room['song'] and 'revision' in d and current_round:
-                    player['prepared']=d.get('ok') is True
-                    if not player['prepared']:player['ready']=False
-                    await update_state(room);await maybe_start(room)
-                elif op=='ready' and player and phase=='lobby' and current_round:
-                    player['ready']=d.get('ready') is True and player['prepared']
-                    await update_state(room);await maybe_start(room)
+                elif op=='prepared':
+                    # Explicit, individual receipt so local candidate-read success cannot be confused
+                    # with server acceptance. Legacy clients without 'song' still work.
+                    reason = ''
+                    if player is None: reason = 'Not a player'
+                    elif phase != 'lobby': reason = 'Round is not in lobby'
+                    elif not room['song']: reason = 'Host has not selected a chart'
+                    elif 'revision' not in d or not current_round: reason = 'Stale song revision'
+                    elif d.get('ok') is not True and d.get('ok') is not False: reason = 'Invalid prepared flag'
+                    elif d.get('ok') is True and 'song' in d and d['song'] != room['song']: reason = 'Chart mismatch: expected ' + room['song']
+                    accepted = not reason
+                    if accepted:
+                        # Clearing readiness must work even after the candidate changes.
+                        # Only prepared=true requires the exact server song signature.
+                        player['prepared'] = d['ok'] is True
+                        if not player['prepared']: player['ready'] = False
+                    packet = dict(op='prepared_result', ok=accepted, prepared=player['prepared'] if player else False,
+                                  revision=room['revision'], song=room['song'], message=reason or 'Prepared state accepted')
+                    print(f"[PVP PREPARED] room={room['code']} player={name} accepted={accepted} requested={d.get('ok')} revision={revision} reason={reason or 'OK'}", flush=True)
+                    await send(ws, packet)
+                    if accepted:
+                        await update_state(room)
+                        await maybe_start(room)
+                elif op=='ready':
+                    reason = ''
+                    if player is None: reason = 'Not a player'
+                    elif phase != 'lobby': reason = 'Round is not in lobby'
+                    elif not room['song']: reason = 'Host has not selected a chart'
+                    elif not current_round: reason = 'Stale song revision'
+                    elif d.get('ready') is True and not player['prepared']: reason = 'Chart not prepared/confirmed'
+                    elif d.get('ready') is not True and d.get('ready') is not False: reason = 'Invalid ready flag'
+                    accepted = not reason
+                    if accepted: player['ready'] = d['ready'] is True
+                    print(f"[PVP READY] room={room['code']} player={name} accepted={accepted} ready={player['ready'] if player else False} revision={revision} reason={reason or 'OK'}", flush=True)
+                    await send(ws,dict(op='ready_result',ok=accepted,ready=player['ready'] if player else False,
+                                       revision=room['revision'],message=reason or 'Ready state accepted'))
+                    if accepted:
+                        await update_state(room)
+                        await maybe_start(room)
                 elif op=='start' and is_host and phase=='lobby' and current_round:
                     if not await maybe_start(room):
                         await send(ws,dict(op='error',message='Select a chart and ready all players (minimum two participants)'))
@@ -416,9 +586,17 @@ async def websocket(request):
                         advance_match(room)
                         await update_state(room)
                 elif op=='launch_failed' and player and phase=='playing' and current_round and not player['finished']:
-                    await reset_round(room, f"{player['nickname']} could not start or complete the native chart. Select it again.")
+                    if room['mode'] == 'versus':
+                        # Retry the SAME randomly chosen chart. Never leave the series in a
+                        # lobby with an empty song (manual song choice is forbidden here).
+                        room['versus_round_recorded'] = False
+                        await reset_round(room, f"{player['nickname']} failed to launch. Retry this chart with F9.", song=room['versus_tracks'][room['versus_index']])
+                    else:
+                        await reset_round(room, f"{player['nickname']} could not start or complete the native chart. Select it again.")
                 elif op in ('next_round', 'reset') and current_round:
-                    if is_host and phase == 'finished':
+                    if room['mode'] == 'versus':
+                        await send(ws,dict(op='versus_error',message='Use versus_next / versus_restart'))
+                    elif is_host and phase == 'finished':
                         await reset_round(room)
                     else:
                         await send(ws, dict(op='error', message='The host can prepare the next round after the match finishes'))
@@ -432,7 +610,7 @@ async def websocket(request):
             await detach_room(ws, room, player)
     return ws
 
-async def health(request): return web.json_response(dict(service='WJMAX PvP',version=VERSION,status='ok',transport='websocket',rooms=len(ROOMS),account_backend='configured' if AUTH_ON else 'not_configured'))
+async def health(request): return web.json_response(dict(service='WJMAX PvP',version=VERSION,build_version=BUILD_VERSION,status='ok',transport='websocket',rooms=len(ROOMS),account_backend='configured' if AUTH_ON else 'not_configured'))
 app=web.Application()
 app.router.add_get('/',health)
 app.router.add_get('/health',health)
