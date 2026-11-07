@@ -8,12 +8,18 @@ from aiohttp import web, ClientSession
 ROOMS = {}
 MAX_CLIENTS = 8
 VERSION = '0.22.7'  # Retained wire version for existing deployed clients; song sync adds optional fields
-BUILD_VERSION = '0.22.13'
+BUILD_VERSION = '0.16.0'
 BOT_MIN_SCORE = 950_000
 BOT_MAX_SCORE = 1_000_000
 START_DELAY_MS = 3000
 MAX_CHART_NOTES = 50_000
-VERSUS_POOL_LIMIT = 240
+# Each WebSocket message carries at most 100 chart-level signatures, allowing the
+# entire matching native catalogue to be uploaded without a 240-chart truncation.
+VERSUS_POOL_LIMIT = 100
+VERSUS_MAX_UPLOAD = 12000
+VERSUS_MAX_PARTS = (VERSUS_MAX_UPLOAD + VERSUS_POOL_LIMIT - 1) // VERSUS_POOL_LIMIT
+VERSUS_MIN_LEVEL, VERSUS_MAX_LEVEL = 1, 50
+VERSUS_JUDGE_NAMES = ('NORMAL', 'PLUS', 'EXPERT', 'MASTER', 'NIGHTMARE')
 VERSUS_CANDIDATES = 5
 GITHUB_REPO = os.getenv('PVP_ACCOUNTS_REPO', '').strip()  # owner/private-repo
 GITHUB_TOKEN = os.getenv('PVP_GITHUB_TOKEN', '').strip()
@@ -176,7 +182,9 @@ def room_state(r):
                      versus_index=r['versus_index'], versus_wins1=r['versus_wins'].get(0, 0),
                      versus_wins2=r['versus_wins'].get(1, 0), versus_winner=r['versus_winner'],
                      versus_pool_received=sum(bool(v) for v in r['versus_pools'].values()),
-                     versus_history=list(r['versus_history']))
+                     versus_history=list(r['versus_history']),
+                     versus_level_min=r['versus_level_min'], versus_level_max=r['versus_level_max'],
+                     versus_judges=list(r['versus_judges']))
     return state
 
 async def update_state(r): await broadcast(r, room_state(r))
@@ -259,41 +267,118 @@ def advance_match(room):
         versus_record_round(room)
 
 def versus_valid_chart(value):
-    if not isinstance(value, str) or len(value) > 200:
+    """A chart candidate is a playable (song, MODE, KEY, displayed star) tuple."""
+    if not isinstance(value, str) or len(value) > 220 or any(ord(c) < 32 for c in value):
         return False
     parts = value.split('|')
-    return (len(parts) == 3 and all(x and x.strip() == x for x in parts)
+    return (len(parts) == 4 and all(x and x.strip() == x for x in parts)
             and parts[2] in ('Key4', 'Key5', 'Key6')
             and bool(re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,24}', parts[1]))
-            and not any(ord(c) < 32 for c in value))
+            and bool(re.fullmatch(r'[0-9]{1,2}', parts[3]))
+            and VERSUS_MIN_LEVEL <= int(parts[3]) <= VERSUS_MAX_LEVEL)
+
+
+def versus_play_signature(candidate):
+    # Do not pass the matchmaking-only ★ level into the existing song protocol.
+    # The native game resolves exactly the original rootFileName|MODE|KEY pattern.
+    if not versus_valid_chart(candidate):
+        raise ValueError('Invalid random-versus candidate')
+    return candidate.rsplit('|', 1)[0]
 
 
 def versus_initialize(room):
-    room.update(versus_stage='pool', versus_candidates=[], versus_tracks=[],
-                versus_bans={}, versus_ban_turn=0, versus_pools={},
+    # Keep the host's selected ranges/judges on rematch, reset all sampled state.
+    room.update(versus_stage='setup', versus_candidates=[], versus_tracks=[],
+                versus_bans={}, versus_ban_turn=0, versus_pools={}, versus_uploads={},
                 versus_wins={0: 0, 1: 0}, versus_index=0,
+                versus_level_min=room.get('versus_level_min', 1),
+                versus_level_max=room.get('versus_level_max', 30),
+                versus_judges=list(room.get('versus_judges', [1, 1, 1])),
                 versus_winner='', versus_history=[], versus_round_recorded=False)
 
 
-async def versus_offer_pool(room, player, raw):
+async def versus_set_range(room, ws, minimum, maximum):
+    if room['phase'] != 'lobby' or room['versus_stage'] not in ('setup', 'pool'):
+        await send(ws, dict(op='versus_error', message='Star range can only change before BAN')); return
+    if type(minimum) is not int or type(maximum) is not int or not VERSUS_MIN_LEVEL <= minimum <= maximum <= VERSUS_MAX_LEVEL:
+        await send(ws, dict(op='versus_error', message='Invalid star range (1-50; min <= max)')); return
+    if (minimum, maximum) == (room['versus_level_min'], room['versus_level_max']): return
+    room['versus_level_min'], room['versus_level_max'] = minimum, maximum
+    room['versus_stage'] = 'setup'   # explicit new draw required
+    room['versus_pools'].clear()
+    room['versus_uploads'].clear()
+    print(f"[PVP VERSUS] range room={room['code']} ★{minimum}-★{maximum} invalidated uploads", flush=True)
+    await reset_round(room, message=f'Star range changed to {minimum}-{maximum}; both players must re-upload charts')
+
+
+async def versus_draw(room, ws):
+    if room['versus_stage'] != 'setup' or room['phase'] != 'lobby':
+        await send(ws, dict(op='versus_error', message='Draw is available only during host setup')); return
+    if len(room['players']) != 2:
+        await send(ws, dict(op='versus_error', message='Two players must join before the five-chart draw')); return
+    room['versus_stage'] = 'pool'
+    room['versus_pools'].clear()
+    room['versus_uploads'].clear()
+    print(f"[PVP VERSUS] draw requested room={room['code']} ★{room['versus_level_min']}-★{room['versus_level_max']}", flush=True)
+    await reset_round(room, message='Host confirmed star range: both players upload native charts now')
+
+
+async def versus_set_judge(room, ws, index, judge):
+    if room['versus_stage'] == 'complete' or room['phase'] == 'playing':
+        await send(ws, dict(op='versus_error', message='Judge mode cannot change during/after play')); return
+    if type(index) is not int or type(judge) is not int or not 0 <= index < 3 or not 0 <= judge < len(VERSUS_JUDGE_NAMES):
+        await send(ws, dict(op='versus_error', message='Invalid round/judge mode')); return
+    if room['versus_stage'] == 'round' and index < room['versus_index']:
+        await send(ws, dict(op='versus_error', message='Completed round cannot be modified')); return
+    if room['versus_stage'] == 'round' and room['phase'] == 'finished' and index <= room['versus_index']:
+        await send(ws, dict(op='versus_error', message='Round is already finished')); return
+    if room['versus_judges'][index] == judge: return
+    room['versus_judges'][index] = judge
+    print(f"[PVP VERSUS JUDGE] room={room['code']} round={index+1} mode={VERSUS_JUDGE_NAMES[judge]}", flush=True)
+    if room['versus_stage'] == 'round' and index == room['versus_index']:
+        # Increment revision and invalidate each player's ready/prepared receipt.
+        await reset_round(room, song=versus_play_signature(room['versus_tracks'][index]),
+                          message='Host changed round judgement; both players must F9 again')
+    else:
+        await update_state(room)
+
+
+async def versus_offer_pool(room, player, raw, part, total):
     if room['versus_stage'] != 'pool' or room['phase'] != 'lobby':
         await send(player['ws'], dict(op='versus_error', message='Song pool is not open')); return
-    if not isinstance(raw, list) or not 5 <= len(raw) <= VERSUS_POOL_LIMIT or any(not versus_valid_chart(x) for x in raw):
-        await send(player['ws'], dict(op='versus_error', message='Invalid native chart list (5-240 chart signatures)')); return
-    pool = set(raw)
-    room['versus_pools'][player['slot']] = pool
-    print(f"[PVP VERSUS] pool room={room['code']} slot={player['slot']} size={len(pool)}", flush=True)
+    if (type(part) is not int or type(total) is not int or not 0 <= part < total <= VERSUS_MAX_PARTS or
+        not isinstance(raw, list) or not 1 <= len(raw) <= VERSUS_POOL_LIMIT or
+        any(not versus_valid_chart(x) for x in raw)):
+        await send(player['ws'], dict(op='versus_error', message='Invalid native chart chunk/level (100 per part, ★1-50)')); return
+    if any(not room['versus_level_min'] <= int(x.rsplit('|', 1)[-1]) <= room['versus_level_max'] for x in raw):
+        await send(player['ws'], dict(op='versus_error', message='A chart is outside the host-selected star range')); return
+    slot = player['slot']
+    upload = room['versus_uploads'].get(slot)
+    if upload is None or (part == 0 and 0 in upload['parts'] and upload['parts'][0] != raw):
+        upload = {'total': total, 'parts': {}}
+        room['versus_uploads'][slot] = upload
+        room['versus_pools'].pop(slot, None)
+    if upload['total'] != total or (part in upload['parts'] and upload['parts'][part] != raw):
+        await send(player['ws'], dict(op='versus_error', message='Inconsistent chart upload; restart from chunk 0')); return
+    upload['parts'][part] = raw
+    if len(upload['parts']) != total: return
+    all_charts = [item for k in range(total) for item in upload['parts'][k]]
+    if len(all_charts) > VERSUS_MAX_UPLOAD or len(set(all_charts)) < 5:
+        await send(player['ws'], dict(op='versus_error', message='Invalid complete chart upload (5-12000 unique charts)')); return
+    room['versus_pools'][slot] = set(all_charts)
+    print(f"[PVP VERSUS] pool complete room={room['code']} slot={slot} size={len(room['versus_pools'][slot])} chunks={total} ★{room['versus_level_min']}-★{room['versus_level_max']}", flush=True)
     if len(room['players']) != 2 or len(room['versus_pools']) != 2:
         await update_state(room); return
     common = sorted(set.intersection(*room['versus_pools'].values()))
     if len(common) < VERSUS_CANDIDATES:
-        await broadcast(room, dict(op='versus_error', message='Two players share fewer than five verified chart signatures; check installed charts/key/mode'))
+        await broadcast(room, dict(op='versus_error', message='Both players have fewer than five common charts in the star range; change range or key availability'))
         await update_state(room); return
-    # secrets.SystemRandom for fresh 5-chart selection, never client-authoritative.
+    # Server picks ONCE from the complete filtered intersection. BAN removes only
+    # from this immutable five; never draw a fresh three from the complete pool.
     room['versus_candidates'] = secrets.SystemRandom().sample(common, VERSUS_CANDIDATES)
     room['versus_stage'] = 'ban'
     room['versus_ban_turn'] = min(p['slot'] for p in room['players'])
-    print(f"[PVP VERSUS] BAN room={room['code']} candidates={room['versus_candidates']}", flush=True)
+    print(f"[PVP VERSUS] BAN room={room['code']} 5 locked={room['versus_candidates']}", flush=True)
     await update_state(room)
 
 
@@ -315,7 +400,7 @@ async def versus_apply_ban(room, player, index):
     room['versus_stage'] = 'round'
     room['versus_index'] = 0
     room['versus_round_recorded'] = False
-    await reset_round(room, song=room['versus_tracks'][0])
+    await reset_round(room, song=versus_play_signature(room['versus_tracks'][0]))
 
 
 def versus_record_round(room):
@@ -350,7 +435,7 @@ async def versus_next(room):
         await update_state(room)
         return True
     room['versus_round_recorded'] = False
-    await reset_round(room, song=room['versus_tracks'][room['versus_index']])
+    await reset_round(room, song=versus_play_signature(room['versus_tracks'][room['versus_index']]))
     return True
 
 
@@ -462,7 +547,10 @@ async def websocket(request):
                     if mode not in ('ffa','teams','versus'): mode='ffa'
                     max_players = d.get('max_players',4)
                     if type(max_players)!=int or not 2<=max_players<=MAX_CLIENTS: max_players=4
-                    if mode == 'versus': max_players = 2
+                    if mode == 'versus':
+                        if d.get('versus_version') != 2:
+                            await send(ws, dict(op='error', message='Versus requires v0.16.0 client')); continue
+                        max_players = 2
                     code = secrets.token_hex(3).upper()
                     room = dict(code=code,name=str(d.get('name','WJMAX PvP'))[:30],host=ws,players=[],spectators=set(),members={ws},
                                 max_players=max_players,mode=mode,public=d.get('public',True) is True,phase='lobby',song='',revision=0,
@@ -474,8 +562,8 @@ async def websocket(request):
                     room = ROOMS.get(code)
                     if not room:
                         await send(ws,dict(op='error',message='Room not found'));continue
-                    if op=='join' and room['mode'] == 'versus' and d.get('versus_capable') is not True:
-                        await send(ws,dict(op='error',message='Versus mode requires v0.22.13+ client'));room=None;continue
+                    if op=='join' and room['mode'] == 'versus' and d.get('versus_version') != 2:
+                        await send(ws,dict(op='error',message='Versus mode requires v0.16.0 client (level/judge protocol v2)'));room=None;continue
                     if op=='join' and (room['phase']!='lobby' or len(room['players'])>=room['max_players']):
                         await send(ws,dict(op='error',message='Room is full or already playing'));room=None;continue
                     room['members'].add(ws)
@@ -493,7 +581,13 @@ async def websocket(request):
                 revision = d.get('revision', room['revision'])
                 current_round = type(revision) is int and revision == room['revision']
                 if op == 'chart_pool' and player and room['mode'] == 'versus' and current_round:
-                    await versus_offer_pool(room, player, d.get('charts'))
+                    await versus_offer_pool(room, player, d.get('charts'), d.get('part'), d.get('total'))
+                elif op == 'versus_range' and room['mode'] == 'versus' and is_host and current_round:
+                    await versus_set_range(room, ws, d.get('min_level'), d.get('max_level'))
+                elif op == 'versus_draw' and room['mode'] == 'versus' and is_host and current_round:
+                    await versus_draw(room, ws)
+                elif op == 'versus_judge' and room['mode'] == 'versus' and is_host and current_round:
+                    await versus_set_judge(room, ws, d.get('index'), d.get('judge'))
                 elif op == 'versus_ban' and player and room['mode'] == 'versus' and current_round:
                     await versus_apply_ban(room, player, d.get('index'))
                 elif op == 'versus_next' and is_host and room['mode'] == 'versus' and current_round:
@@ -590,7 +684,7 @@ async def websocket(request):
                         # Retry the SAME randomly chosen chart. Never leave the series in a
                         # lobby with an empty song (manual song choice is forbidden here).
                         room['versus_round_recorded'] = False
-                        await reset_round(room, f"{player['nickname']} failed to launch. Retry this chart with F9.", song=room['versus_tracks'][room['versus_index']])
+                        await reset_round(room, f"{player['nickname']} failed to launch. Retry this chart with F9.", song=versus_play_signature(room['versus_tracks'][room['versus_index']]))
                     else:
                         await reset_round(room, f"{player['nickname']} could not start or complete the native chart. Select it again.")
                 elif op in ('next_round', 'reset') and current_round:
