@@ -8,7 +8,7 @@ from aiohttp import web, ClientSession
 ROOMS = {}
 MAX_CLIENTS = 8
 VERSION = '0.22.7'  # Retained wire version for existing deployed clients; song sync adds optional fields
-BUILD_VERSION = '0.17.0'
+BUILD_VERSION = '0.17.1'
 BOT_MIN_SCORE = 950_000
 BOT_MAX_SCORE = 1_000_000
 START_DELAY_MS = 3000
